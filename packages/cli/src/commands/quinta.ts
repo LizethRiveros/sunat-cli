@@ -1,5 +1,8 @@
+import { readFileSync } from "node:fs";
 import { Command } from "commander";
 import { type GastoKey, type QuintaInput, simularQuinta, UIT_2026 } from "../quinta/calc.ts";
+import { compararConSunat, parseCsvSunat } from "../quinta/comparar.ts";
+import { parseCpeQr, qrLlevaDni } from "../quinta/qr.ts";
 import { agregarGasto, gastosPath, loadGastos, resumirGastos, saveGastos } from "../quinta/gastos.ts";
 import { isHumanFormat, output, outputError } from "../utils/output.ts";
 import { bold, dim, muted } from "../utils/style.ts";
@@ -45,6 +48,8 @@ export function createQuintaCommand(): Command {
 		.option("--meses <n>", "Months worked in the year (1-12)", "12")
 		.option("--gratificaciones <monto>", "Gratificaciones for the year (default: 2 x remuneración)")
 		.option("--otros-ingresos <monto>", "Other annual quinta income (bonos, utilidades)")
+		.option("--ingresos-4ta <monto>", "Gross annual cuarta categoría income (recibos por honorarios), taxed together with quinta")
+		.option("--retenido-4ta <monto>", "Retenciones and pagos a cuenta already paid on cuarta")
 		.option("--uit <monto>", `UIT of the year (default ${UIT_2026})`)
 		.option("--alquiler <monto>", "Annual rent paid, with receipts (30% counts)")
 		.option("--restaurantes <monto>", "Restaurants and hotels, with receipts (15% counts)")
@@ -61,6 +66,8 @@ export function createQuintaCommand(): Command {
 					gratificaciones: num(opts.gratificaciones, "--gratificaciones"),
 					otrosIngresos: num(opts.otrosIngresos, "--otros-ingresos"),
 					uit: num(opts.uit, "--uit"),
+					ingresos4ta: num(opts.ingresos4ta, "--ingresos-4ta"),
+					retenido4ta: num(opts.retenido4ta, "--retenido-4ta"),
 					retenido: num(opts.retenido, "--retenido"),
 					gastos: {
 						alquiler: num(opts.alquiler, "--alquiler"),
@@ -79,6 +86,7 @@ export function createQuintaCommand(): Command {
 				console.log(dim(`  sin gastos: ${s(r.impuestoSinGastos)} · ahorro por gastos: ${s(r.ahorro)}`));
 				console.log();
 				console.log(`Renta bruta anual        ${s(r.rentaBruta)}`);
+				if (r.deduccion4ta > 0) console.log(`(-) 20% de 4ta          ${s(r.deduccion4ta)}`);
 				console.log(`(-) 7 UIT                ${s(r.deduccionFija)}`);
 				console.log(`(-) gastos (3 UIT)       ${s(r.deduccionAdicional.total)} de ${s(r.deduccionAdicional.tope)}`);
 				console.log(`Renta neta               ${s(r.rentaNetaConGastos)}`);
@@ -118,6 +126,18 @@ export function createQuintaCommand(): Command {
 		medicos: "honorariosMedicos",
 		profesionales: "honorariosProfesionales",
 		"essalud-hogar": "essaludHogar",
+		// aliases: the 15% category covers hotels, restaurants and bars
+		hoteles: "restaurantes",
+		bares: "restaurantes",
+	};
+
+	/** Document SUNAT accepts per category: a plain boleta only works for the 15% one. */
+	const SUSTENTO: Record<GastoKey, string | null> = {
+		restaurantes: null,
+		alquiler: "El alquiler se sustenta con Recibo por Arrendamiento (Form. 1683) o factura, no con boleta.",
+		honorariosMedicos: "Médicos y odontólogos se sustentan con recibo por honorarios electrónico, no con boleta.",
+		honorariosProfesionales: "Profesionales y oficios (4ta) se sustentan con recibo por honorarios electrónico, no con boleta.",
+		essaludHogar: "El EsSalud del hogar se sustenta con el Formulario Virtual 1676, no con boleta.",
 	};
 
 	const ejercicioOf = (raw: unknown): number => {
@@ -131,10 +151,12 @@ export function createQuintaCommand(): Command {
 	gastos
 		.command("add")
 		.description("Record one receipt in the local ledger. T1.")
-		.requiredOption("--fecha <YYYY-MM-DD>", "Date on the receipt")
-		.requiredOption("--ruc <ruc>", "RUC of the issuer (11 digits)")
-		.requiredOption("--comprobante <serie-numero>", "Serie and number, e.g. B001-12345")
-		.requiredOption("--monto <monto>", "Total amount (S/)")
+		.option("--qr <texto>", "Text decoded from the QR of the boleta (fills ruc, comprobante, monto and fecha)")
+		.option("--dni <dni>", "Your DNI, to check the QR names you (recommended with --qr)")
+		.option("--fecha <YYYY-MM-DD>", "Date on the receipt")
+		.option("--ruc <ruc>", "RUC of the issuer (11 digits)")
+		.option("--comprobante <serie-numero>", "Serie and number, e.g. B001-12345")
+		.option("--monto <monto>", "Total amount (S/)")
 		.requiredOption("--categoria <cat>", `One of: ${Object.keys(CATEGORIA_FLAG).join(", ")}`)
 		.option("--sin-dni", "The receipt does NOT carry your DNI/RUC (kept, but not counted)")
 		.option("--nota <texto>", "Free note")
@@ -144,20 +166,44 @@ export function createQuintaCommand(): Command {
 			try {
 				const categoria = CATEGORIA_FLAG[String(opts.categoria)];
 				if (!categoria) throw new Error(`--categoria must be one of: ${Object.keys(CATEGORIA_FLAG).join(", ")}`);
-				const file = loadGastos(ejercicioOf(opts.ejercicio));
+				let fecha = opts.fecha as string | undefined;
+				let ruc = opts.ruc as string | undefined;
+				let comprobante = opts.comprobante as string | undefined;
+				let monto = num(opts.monto, "--monto");
+				let llevaDni = !opts.sinDni;
+				const avisos: string[] = [];
+				if (opts.qr) {
+					const qr = parseCpeQr(String(opts.qr));
+					fecha = qr.fecha;
+					ruc = qr.rucEmisor;
+					comprobante = qr.comprobante;
+					monto = qr.total;
+					if (opts.dni) {
+						llevaDni = qrLlevaDni(qr, String(opts.dni));
+						if (!llevaDni) avisos.push("El QR no muestra tu DNI: se guarda como «sin DNI» y no suma.");
+					} else {
+						avisos.push("Sin --dni no puedo comprobar que la boleta esté a tu nombre; la cuento como con DNI.");
+					}
+				}
+				if (!fecha || !ruc || !comprobante || monto === undefined) {
+					throw new Error("Falta fecha, ruc, comprobante o monto (o pasa --qr).");
+				}
+				const sustento = SUSTENTO[categoria];
+				if (sustento) avisos.push(sustento);
+				const file = loadGastos(ejercicioOf(opts.ejercicio ?? fecha.slice(0, 4)));
 				const added = agregarGasto(file, {
-					fecha: String(opts.fecha),
-					rucEmisor: String(opts.ruc),
-					comprobante: String(opts.comprobante),
-					monto: num(opts.monto, "--monto") as number,
+					fecha,
+					rucEmisor: ruc,
+					comprobante,
+					monto,
 					categoria,
-					llevaDni: !opts.sinDni,
+					llevaDni,
 					nota: opts.nota,
 				});
 				if (added) saveGastos(file);
 				const resumen = resumirGastos(file);
 				if (!isHumanFormat(format)) {
-					output(format, { json: { command: "quinta gastos add", added, duplicate: !added, resumen } });
+					output(format, { json: { command: "quinta gastos add", added, duplicate: !added, avisos, resumen } });
 					return;
 				}
 				console.log(
@@ -165,7 +211,8 @@ export function createQuintaCommand(): Command {
 						? `Registrado. ${bold(s(resumen.deduccionTotal))} de ${s(resumen.tope)} (${resumen.avance}%)`
 						: muted("Ya estaba registrado; no se duplicó."),
 				);
-				if (opts.sinDni) console.log(dim("  Sin DNI: se guarda, pero no suma a la deducción."));
+				if (!llevaDni) console.log(dim("  Sin DNI: se guarda, pero no suma a la deducción."));
+				for (const a of avisos) console.log(dim(`  ! ${a}`));
 			} catch (err) {
 				outputError(err instanceof Error ? err.message : String(err), format);
 			}
@@ -230,6 +277,44 @@ export function createQuintaCommand(): Command {
 				}
 				console.log();
 				console.log(dim("Que SUNAT las tenga a tu nombre se confirma solo en SOL > Propuesta de información."));
+			} catch (err) {
+				outputError(err instanceof Error ? err.message : String(err), format);
+			}
+		});
+
+	gastos
+		.command("comparar")
+		.description(
+			"Compare the ledger with the table of Propuesta de información (CSV with ruc, serie/numero or comprobante, monto). Offline. T0.",
+		)
+		.requiredOption("--archivo <ruta>", "CSV copied from SOL > Renta anual > Propuesta de información")
+		.option("--ejercicio <año>", "Tax year (default: current year)")
+		.action((opts, cmd) => {
+			const format = getFormat(cmd);
+			try {
+				const file = loadGastos(ejercicioOf(opts.ejercicio));
+				const filas = parseCsvSunat(readFileSync(String(opts.archivo), "utf8"));
+				const c = compararConSunat(file, filas);
+				if (!isHumanFormat(format)) {
+					output(format, { json: { command: "quinta gastos comparar", ejercicio: file.ejercicio, ...c } });
+					return;
+				}
+				console.log(`${bold(`Cuaderno vs SUNAT ${file.ejercicio}`)}  ${c.coinciden.length} coinciden`);
+				if (c.soloCuaderno.length > 0) {
+					console.log();
+					console.log(`! ${c.soloCuaderno.length} en tu cuaderno que SUNAT NO muestra (el emisor quizá no las declaró con el DNI):`);
+					for (const g of c.soloCuaderno) console.log(`  ${g.fecha} ${g.comprobante.padEnd(16)} ${s(g.monto)}  RUC ${g.rucEmisor}`);
+				}
+				if (c.difierenMonto.length > 0) {
+					console.log();
+					console.log(`! ${c.difierenMonto.length} con monto distinto:`);
+					for (const d of c.difierenMonto) console.log(`  ${d.gasto.comprobante}: cuaderno ${s(d.gasto.monto)} vs SUNAT ${s(d.montoSunat)}`);
+				}
+				if (c.soloSunat.length > 0) {
+					console.log();
+					console.log(`${c.soloSunat.length} que SUNAT tiene y tu cuaderno no (agrégalas si son tuyas):`);
+					for (const r of c.soloSunat) console.log(`  ${r.comprobante.padEnd(16)} ${r.monto !== undefined ? s(r.monto) : ""}  RUC ${r.rucEmisor}`);
+				}
 			} catch (err) {
 				outputError(err instanceof Error ? err.message : String(err), format);
 			}

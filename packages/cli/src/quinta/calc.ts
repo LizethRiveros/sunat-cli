@@ -17,6 +17,9 @@ export const UIT_2026 = 5500;
 export const DEDUCCION_FIJA_UIT = 7;
 /** Cap of the additional deduction for expenses, in UIT. */
 export const DEDUCCION_ADICIONAL_TOPE_UIT = 3;
+/** Cuarta categoría: share of the gross income deducted, and its cap in UIT. */
+export const DEDUCCION_4TA_PCT = 0.2;
+export const DEDUCCION_4TA_TOPE_UIT = 24;
 
 /** Cumulative brackets: [upper bound in UIT, marginal rate]. */
 const TRAMOS: ReadonlyArray<readonly [number, number]> = [
@@ -47,6 +50,10 @@ export interface QuintaInput {
 	gratificaciones?: number;
 	/** Any other annual quinta income (bonuses, utilidades...). */
 	otrosIngresos?: number;
+	/** Gross annual cuarta categoría income (recibos por honorarios), taxed together with quinta. */
+	ingresos4ta?: number;
+	/** Retenciones and pagos a cuenta already paid on cuarta categoría. */
+	retenido4ta?: number;
 	uit?: number;
 	/** Documented expenses paid in the year, by category. */
 	gastos?: Partial<Record<GastoKey, number>>;
@@ -56,7 +63,10 @@ export interface QuintaInput {
 
 export interface QuintaResultado {
 	uit: number;
+	/** Quinta + cuarta gross income. */
 	rentaBruta: number;
+	/** 20% deduction on cuarta income (capped at 24 UIT); 0 when there is none. */
+	deduccion4ta: number;
 	deduccionFija: number;
 	rentaNeta: number;
 	impuestoSinGastos: number;
@@ -102,10 +112,17 @@ export function simularQuinta(input: QuintaInput): QuintaResultado {
 	}
 	if (!Number.isInteger(meses) || meses < 1 || meses > 12) throw new Error("meses must be an integer from 1 to 12");
 
+	const ingresos4ta = input.ingresos4ta ?? 0;
+	if (!Number.isFinite(ingresos4ta) || ingresos4ta < 0) throw new Error("ingresos4ta must be a non-negative number");
 	const grat = input.gratificaciones ?? (meses === 12 ? input.remuneracion * 2 : 0);
-	const rentaBruta = input.remuneracion * meses + grat + (input.otrosIngresos ?? 0);
-	const deduccionFija = Math.min(rentaBruta, DEDUCCION_FIJA_UIT * uit);
-	const rentaNeta = rentaBruta - deduccionFija;
+	const bruta5ta = input.remuneracion * meses + grat + (input.otrosIngresos ?? 0);
+	// Cuarta: 20% off the gross, up to 24 UIT. Quinta and cuarta then share
+	// ONE 7 UIT deduction and ONE 3 UIT deduction (SUNAT cartilla 2.3.3).
+	const deduccion4ta = Math.min(ingresos4ta * DEDUCCION_4TA_PCT, DEDUCCION_4TA_TOPE_UIT * uit);
+	const rentaBruta = bruta5ta + ingresos4ta;
+	const rentaPrevia = rentaBruta - deduccion4ta;
+	const deduccionFija = Math.min(rentaPrevia, DEDUCCION_FIJA_UIT * uit);
+	const rentaNeta = rentaPrevia - deduccionFija;
 	const impuestoSinGastos = impuestoProgresivo(rentaNeta, uit);
 
 	const tope = DEDUCCION_ADICIONAL_TOPE_UIT * uit;
@@ -129,10 +146,11 @@ export function simularQuinta(input: QuintaInput): QuintaResultado {
 	}
 
 	let saldo: QuintaResultado["saldo"] = null;
-	if (input.retenido !== undefined) {
-		const diff = r2(impuestoConGastos - input.retenido);
+	if (input.retenido !== undefined || input.retenido4ta !== undefined) {
+		const retenido = (input.retenido ?? 0) + (input.retenido4ta ?? 0);
+		const diff = r2(impuestoConGastos - retenido);
 		saldo = {
-			retenido: r2(input.retenido),
+			retenido: r2(retenido),
 			resultado: Math.abs(diff),
 			tipo: diff > 0 ? "a_pagar" : diff < 0 ? "a_favor" : "sin_saldo",
 		};
@@ -141,6 +159,7 @@ export function simularQuinta(input: QuintaInput): QuintaResultado {
 	return {
 		uit,
 		rentaBruta: r2(rentaBruta),
+		deduccion4ta: r2(deduccion4ta),
 		deduccionFija: r2(deduccionFija),
 		rentaNeta: r2(rentaNeta),
 		impuestoSinGastos: r2(impuestoSinGastos),
@@ -148,9 +167,11 @@ export function simularQuinta(input: QuintaInput): QuintaResultado {
 		rentaNetaConGastos: r2(rentaNetaConGastos),
 		impuestoConGastos: r2(impuestoConGastos),
 		ahorro: r2(impuestoSinGastos - impuestoConGastos),
-		// The employer withholds without the 3 UIT deduction, so the monthly
-		// figure is the tax without expenses spread over the year.
-		retencionMensualAprox: r2(impuestoSinGastos / 12),
+		// The employer withholds without the 3 UIT deduction and without seeing
+		// the cuarta income, so this is the quinta-only tax spread over the year.
+		retencionMensualAprox: r2(
+			ingresos4ta > 0 ? simularQuinta({ ...input, ingresos4ta: 0, retenido: undefined, retenido4ta: undefined, gastos: undefined }).impuestoSinGastos / 12 : impuestoSinGastos / 12,
+		),
 		saldo,
 		gastoNecesarioParaTope,
 	};
